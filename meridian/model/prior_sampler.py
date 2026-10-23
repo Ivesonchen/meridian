@@ -115,8 +115,9 @@ def _sample_time_varying_priors(
 
   With a coefficient prior, `beta` is drawn as usual and is the base coefficient
   that the time effect adjusts. With an ROI, mROI or contribution prior, the
-  caller re-solves `beta` with `ModelEquations._merge_time_varying_beta_x`, so
-  the prior keeps its whole-history meaning.
+  caller solves `beta` with
+  `ModelEquations._calculate_beta_x_with_changepoints`, so the prior keeps its
+  whole-history meaning.
 
   Args:
     changepoint_info: The `ChangepointInfo` of the channel type.
@@ -282,19 +283,17 @@ class PriorDistributionSampler:
             ec_m=ec_m,
             slope_m=slope_m,
         )
-        beta_m = self._model_equations.calculate_beta_x(
-            is_non_media=False,
-            incremental_outcome_x=incremental_outcome,
-            linear_predictor_counterfactual_difference=linear_predictor_counterfactual_difference,
-            eta_x=eta_m,
-            beta_gx_dev=beta_gx_dev,
-        )
         if changepoint_info is None:
-          return beta_m
+          return self._model_equations.calculate_beta_x(
+              is_non_media=False,
+              incremental_outcome_x=incremental_outcome,
+              linear_predictor_counterfactual_difference=linear_predictor_counterfactual_difference,
+              eta_x=eta_m,
+              beta_gx_dev=beta_gx_dev,
+          )
         assert zeta_m is not None and varphi_m is not None
-        return self._model_equations._merge_time_varying_beta_x(  # pylint: disable=protected-access
+        return self._model_equations._calculate_beta_x_with_changepoints(  # pylint: disable=protected-access
             changepoint_info=changepoint_info,
-            beta_x=beta_m,
             incremental_outcome_x=incremental_outcome,
             linear_predictor_counterfactual_difference=linear_predictor_counterfactual_difference,
             eta_x=eta_m,
@@ -330,10 +329,8 @@ class PriorDistributionSampler:
         media_vars[constants.BETA_M][..., backend.newaxis, :]
         + media_vars[constants.ETA_M][..., backend.newaxis, :] * beta_gm_dev
     )
-    beta_gm_value = (
-        beta_eta_combined
-        if ctx.media_effects_dist == constants.MEDIA_EFFECTS_NORMAL
-        else backend.exp(beta_eta_combined)
+    beta_gm_value = self._model_equations._coefficients_from_random_effects(  # pylint: disable=protected-access
+        beta_eta_combined, changepoint_info
     )
     media_vars[constants.BETA_GM] = backend.tfd.Deterministic(
         beta_gm_value, name=constants.BETA_GM
@@ -454,19 +451,17 @@ class PriorDistributionSampler:
                 slope_rf=slope_rf,
             )
         )
-        beta_rf = self._model_equations.calculate_beta_x(
-            is_non_media=False,
-            incremental_outcome_x=incremental_outcome,
-            linear_predictor_counterfactual_difference=linear_predictor_counterfactual_difference,
-            eta_x=eta_rf,
-            beta_gx_dev=beta_gx_dev,
-        )
         if changepoint_info is None:
-          return beta_rf
+          return self._model_equations.calculate_beta_x(
+              is_non_media=False,
+              incremental_outcome_x=incremental_outcome,
+              linear_predictor_counterfactual_difference=linear_predictor_counterfactual_difference,
+              eta_x=eta_rf,
+              beta_gx_dev=beta_gx_dev,
+          )
         assert zeta_rf is not None and varphi_rf is not None
-        return self._model_equations._merge_time_varying_beta_x(  # pylint: disable=protected-access
+        return self._model_equations._calculate_beta_x_with_changepoints(  # pylint: disable=protected-access
             changepoint_info=changepoint_info,
-            beta_x=beta_rf,
             incremental_outcome_x=incremental_outcome,
             linear_predictor_counterfactual_difference=linear_predictor_counterfactual_difference,
             eta_x=eta_rf,
@@ -500,10 +495,8 @@ class PriorDistributionSampler:
         rf_vars[constants.BETA_RF][..., backend.newaxis, :]
         + rf_vars[constants.ETA_RF][..., backend.newaxis, :] * beta_grf_dev
     )
-    beta_grf_value = (
-        beta_eta_combined
-        if ctx.media_effects_dist == constants.MEDIA_EFFECTS_NORMAL
-        else backend.exp(beta_eta_combined)
+    beta_grf_value = self._model_equations._coefficients_from_random_effects(  # pylint: disable=protected-access
+        beta_eta_combined, changepoint_info
     )
     rf_vars[constants.BETA_GRF] = backend.tfd.Deterministic(
         beta_grf_value, name=constants.BETA_GRF

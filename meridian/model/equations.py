@@ -703,19 +703,17 @@ class ModelEquations:
         ),
         eta_x=eta_x,
         beta_gx_dev=beta_gx_dev,
-        # TODO: Use `changepoint_media_effects_dist`, which
-        # defaults to log-normal even in national models.
         random_effects_normal=(
-            self._context.media_effects_dist == constants.MEDIA_EFFECTS_NORMAL
+            self._context._changepoint_media_effects_dist  # pylint: disable=protected-access
+            == constants.MEDIA_EFFECTS_NORMAL
         ),
         time_effect_tx=zeta_x[..., backend.newaxis, :] * phi_tx,
     )
 
-  def _merge_time_varying_beta_x(
+  def _calculate_beta_x_with_changepoints(
       self,
       *,
       changepoint_info: changepoints.ChangepointInfo,
-      beta_x: backend.Tensor,
       incremental_outcome_x: backend.Tensor,
       linear_predictor_counterfactual_difference: backend.Tensor,
       eta_x: backend.Tensor,
@@ -723,18 +721,18 @@ class ModelEquations:
       zeta_x: backend.Tensor,
       varphi_x: backend.Tensor,
   ) -> backend.Tensor:
-    """Re-computes `beta_x` for the channels with changepoints.
+    """Calculates `beta_x` of a paid channel type that has changepoints.
 
-    `calculate_beta_x` ignores the time effect. This function replaces the
-    computation of `beta_x` for channels with changepoints with
-    `_calculate_time_varying_beta_x`. "x" represents "m" or "rf".
+    `calculate_beta_x` ignores the time effect. This function uses
+    `calculate_beta_x` for the channels without changepoints, and
+    `_calculate_time_varying_beta_x` for the channels with changepoints. "x"
+    represents "m" or "rf".
 
     Args:
       changepoint_info: The `ChangepointInfo` of the channel type.
-      beta_x: The `calculate_beta_x` result for all channels of the type, shape
-        `(..., n_channels)`. Here, `n_channels` is the number of all channels
-        of the type, not just the number of channels with changepoints.
-      incremental_outcome_x: As in `calculate_beta_x`, for all channels.
+      incremental_outcome_x: As in `calculate_beta_x`, for all channels of the
+        type, shape `(..., n_channels)`. Here, `n_channels` is the number of all
+        channels of the type, not just the number of channels with changepoints.
       linear_predictor_counterfactual_difference: As in `calculate_beta_x`, for
         all channels.
       eta_x: As in `calculate_beta_x`, for all channels.
@@ -746,7 +744,7 @@ class ModelEquations:
         max_intervals)`.
 
     Returns:
-      `beta_x` with the columns of the channels with changepoints replaced.
+      `beta_x` of all channels of the type, shape `(..., n_channels)`.
     """
     indices = backend.to_tensor(changepoint_info.channel_indices)
     time_varying_beta_x = self._calculate_time_varying_beta_x(
@@ -763,8 +761,27 @@ class ModelEquations:
             varphi_x, changepoint_info.weights
         ),
     )
+    # This runs `calculate_beta_x` on all channels of the type, with
+    # `media_effects_dist`. `merge_channels` then replaces the results of the
+    # channels with changepoints with `time_varying_beta_x`. Their inputs get
+    # placeholder values, because when `changepoint_media_effects_dist` differs,
+    # their real inputs could give infinite results here, and infinite values
+    # break posterior sampling even when they're replaced.
+    regular_beta_x = self.calculate_beta_x(
+        is_non_media=False,
+        incremental_outcome_x=changepoints.fill_channels(
+            incremental_outcome_x, value=1.0, info=changepoint_info
+        ),
+        linear_predictor_counterfactual_difference=(
+            linear_predictor_counterfactual_difference
+        ),
+        eta_x=eta_x,
+        beta_gx_dev=changepoints.fill_channels(
+            beta_gx_dev, value=0.0, info=changepoint_info
+        ),
+    )
     return changepoints.merge_channels(
-        x=beta_x, sub=time_varying_beta_x, info=changepoint_info
+        x=regular_beta_x, sub=time_varying_beta_x, info=changepoint_info
     )
 
   def _split_time_varying_outcome(
@@ -802,20 +819,64 @@ class ModelEquations:
         beta_gx=time_varying_beta_gx,
         zeta=zeta_x,
         phi=changepoints.expand_intervals(varphi_x, changepoint_info.weights),
-        # TODO: Use `changepoint_media_effects_dist`.
-        media_effects_dist=self._context.media_effects_dist,
+        media_effects_dist=self._context._changepoint_media_effects_dist,  # pylint: disable=protected-access
     )
     outcome = backend.einsum(
         "...gtx,...gtx->...gt",
         backend.gather(media_transformed, indices, axis=-1),
         beta_gtx,
     )
-    beta_gx_without = changepoints.merge_channels(
-        x=beta_gx,
-        sub=backend.zeros_like(time_varying_beta_gx),
-        info=changepoint_info,
+    beta_gx_without = changepoints.fill_channels(
+        beta_gx, value=0.0, info=changepoint_info
     )
     return outcome, beta_gx_without
+
+  def _coefficients_from_random_effects(
+      self,
+      beta_eta_combined: backend.Tensor,
+      changepoint_info: changepoints.ChangepointInfo | None,
+  ) -> backend.Tensor:
+    """Returns the geo-level coefficients of the paid channels of one type.
+
+    Channels with changepoints use `changepoint_media_effects_dist` and the
+    others use `media_effects_dist`. "x" represents "m" or "rf".
+
+    Args:
+      beta_eta_combined: `beta_x + eta_x * beta_gx_dev`, shape `(..., n_geos,
+        n_channels)`.
+      changepoint_info: The channels of the type with changepoints, or `None`
+        if none has changepoints.
+
+    Returns:
+      Per channel, `beta_eta_combined` for normal random effects, or its `exp`
+      for log-normal ones.
+    """
+    normal = self._context.media_effects_dist == constants.MEDIA_EFFECTS_NORMAL
+    changepoint_normal = (
+        self._context._changepoint_media_effects_dist  # pylint: disable=protected-access
+        == constants.MEDIA_EFFECTS_NORMAL
+    )
+    if changepoint_info is None or changepoint_normal == normal:
+      if normal:
+        return beta_eta_combined
+      # pyrefly: ignore[bad-argument-type]
+      return backend.exp(beta_eta_combined)
+    indices = backend.to_tensor(changepoint_info.channel_indices)
+    time_varying = backend.gather(beta_eta_combined, indices, axis=-1)
+    # Placeholder zeros for the channels with changepoints, so that `exp` of
+    # their unused values can't be infinite.
+    regular = changepoints.fill_channels(
+        beta_eta_combined, value=0.0, info=changepoint_info
+    )
+    if not normal:
+      # pyrefly: ignore[bad-argument-type]
+      regular = backend.exp(regular)
+    if not changepoint_normal:
+      # pyrefly: ignore[bad-argument-type]
+      time_varying = backend.exp(time_varying)
+    return changepoints.merge_channels(
+        x=regular, sub=time_varying, info=changepoint_info
+    )
 
   def _outcome_per_unit_coefficient(
       self,

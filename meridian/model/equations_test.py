@@ -816,6 +816,12 @@ class CalculateBetaXTest(
     )
 
 
+def _other_media_effects_dist(media_effects_dist: str) -> str:
+  if media_effects_dist == constants.MEDIA_EFFECTS_NORMAL:
+    return constants.MEDIA_EFFECTS_LOG_NORMAL
+  return constants.MEDIA_EFFECTS_NORMAL
+
+
 class CalculateTimeVaryingBetaXTest(
     test_utils.MeridianTestCase, parameterized.TestCase
 ):
@@ -848,12 +854,18 @@ class CalculateTimeVaryingBetaXTest(
     self._revenue_per_kpi = np.abs(normal(self._N_GEOS, self._N_TIMES)) + 0.5
 
   def _equations(
-      self, media_effects_dist: str, with_revenue_per_kpi: bool = True
+      self,
+      media_effects_dist: str,
+      with_revenue_per_kpi: bool = True,
+      changepoint_media_effects_dist: str | None = None,
   ) -> equations.ModelEquations:
     model_context = mock.create_autospec(
         context.ModelContext, instance=True, spec_set=True
     )
     model_context.media_effects_dist = media_effects_dist
+    model_context._changepoint_media_effects_dist = (
+        changepoint_media_effects_dist or media_effects_dist
+    )
     model_context.revenue_per_kpi = (
         backend.to_tensor(self._revenue_per_kpi, dtype=backend.float_dtype)
         if with_revenue_per_kpi
@@ -887,8 +899,11 @@ class CalculateTimeVaryingBetaXTest(
   def test_matches_the_incremental_outcome(
       self, media_effects_dist, with_revenue_per_kpi
   ):
+    # The other channels' distribution doesn't apply.
     beta_x = self._equations(
-        media_effects_dist, with_revenue_per_kpi
+        _other_media_effects_dist(media_effects_dist),
+        with_revenue_per_kpi,
+        changepoint_media_effects_dist=media_effects_dist,
     )._calculate_time_varying_beta_x(**self._tensors())
     self.assertEqual(tuple(beta_x.shape), (3, self._N_CHANNELS))
 
@@ -950,6 +965,79 @@ class CalculateTimeVaryingBetaXTest(
         eqn._calculate_time_varying_beta_x(**tensors), expected, rtol=1e-5
     )
 
+  def test_beta_x_with_changepoints_combines_both_calculations(self):
+    # Channel "b" has changepoints and normal effects; channel "a" is
+    # log-normal.
+    info = changepoints.get_changepoint_info(
+        n_times=self._N_TIMES, changepoints={"b": [3]}, channel_names=["a", "b"]
+    )
+    assert info is not None
+    eqn = self._equations(
+        constants.MEDIA_EFFECTS_LOG_NORMAL,
+        changepoint_media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+    )
+    # With log-normal effects, these values would give infinite results.
+    incremental_outcome_x = self._inputs["incremental_outcome_x"].copy()
+    incremental_outcome_x[:, 1] = 0.0
+    beta_gx_dev = self._inputs["beta_gx_dev"].copy()
+    beta_gx_dev[..., 1] = 1e3
+    tensors = self._tensors(
+        incremental_outcome_x=incremental_outcome_x, beta_gx_dev=beta_gx_dev
+    )
+    zeta_x = tensors["zeta_x"][:, 1:]
+    varphi_x = backend.to_tensor(
+        np.random.default_rng(1).normal(size=(3, 1, 2)),
+        dtype=backend.float_dtype,
+    )
+    regular_inputs = dict(
+        is_non_media=False,
+        incremental_outcome_x=tensors["incremental_outcome_x"],
+        linear_predictor_counterfactual_difference=tensors[
+            "linear_predictor_counterfactual_difference"
+        ],
+        eta_x=tensors["eta_x"],
+        beta_gx_dev=tensors["beta_gx_dev"],
+    )
+    expected_regular = eqn.calculate_beta_x(**regular_inputs)
+    expected_time_varying = eqn._calculate_time_varying_beta_x(
+        incremental_outcome_x=tensors["incremental_outcome_x"][:, 1:],
+        linear_predictor_counterfactual_difference=tensors[
+            "linear_predictor_counterfactual_difference"
+        ][..., 1:],
+        eta_x=tensors["eta_x"][:, 1:],
+        beta_gx_dev=tensors["beta_gx_dev"][..., 1:],
+        zeta_x=zeta_x,
+        phi_tx=changepoints.expand_intervals(varphi_x, info.weights),
+    )
+
+    with mock.patch.object(
+        eqn,
+        "calculate_beta_x",
+        autospec=True,
+        side_effect=eqn.calculate_beta_x,
+    ) as calculate_beta_x:
+      beta_x = eqn._calculate_beta_x_with_changepoints(
+          changepoint_info=info,
+          incremental_outcome_x=tensors["incremental_outcome_x"],
+          linear_predictor_counterfactual_difference=tensors[
+              "linear_predictor_counterfactual_difference"
+          ],
+          eta_x=tensors["eta_x"],
+          beta_gx_dev=tensors["beta_gx_dev"],
+          zeta_x=zeta_x,
+          varphi_x=varphi_x,
+      )
+
+    test_utils.assert_allclose(beta_x[:, 0], expected_regular[:, 0], rtol=1e-5)
+    test_utils.assert_allclose(
+        beta_x[:, 1], expected_time_varying[:, 0], rtol=1e-5
+    )
+    # The calculation for the other channels gets placeholder values for the
+    # channel with changepoints, so that its unused results stay finite.
+    regular_call = calculate_beta_x.call_args.kwargs
+    test_utils.assert_allclose(regular_call["incremental_outcome_x"][:, 1], 1.0)
+    test_utils.assert_allclose(regular_call["beta_gx_dev"][..., 1], 0.0)
+
 
 class SplitTimeVaryingOutcomeTest(
     test_utils.MeridianTestCase, parameterized.TestCase
@@ -984,7 +1072,11 @@ class SplitTimeVaryingOutcomeTest(
     model_context = mock.create_autospec(
         context.ModelContext, instance=True, spec_set=True
     )
-    model_context.media_effects_dist = media_effects_dist
+    # The other channels' distribution doesn't apply.
+    model_context.media_effects_dist = _other_media_effects_dist(
+        media_effects_dist
+    )
+    model_context._changepoint_media_effects_dist = media_effects_dist
 
     def to_tensor(x: np.ndarray) -> backend.Tensor:
       return backend.to_tensor(x, dtype=backend.float_dtype)
@@ -1022,6 +1114,97 @@ class SplitTimeVaryingOutcomeTest(
     expected_beta_gx_without = beta_gx.copy()
     expected_beta_gx_without[..., [0, 2]] = 0.0
     test_utils.assert_allequal(beta_gx_without, expected_beta_gx_without)
+
+
+class CoefficientsFromRandomEffectsTest(
+    test_utils.MeridianTestCase, parameterized.TestCase
+):
+
+  # pylint: disable=protected-access
+
+  def _coefficients(
+      self,
+      beta_eta_combined: np.ndarray,
+      *,
+      media_effects_dist: str,
+      changepoint_media_effects_dist: str,
+      changepoint_info: changepoints.ChangepointInfo | None,
+  ) -> np.ndarray:
+    model_context = mock.create_autospec(
+        context.ModelContext, instance=True, spec_set=True
+    )
+    model_context.media_effects_dist = media_effects_dist
+    model_context._changepoint_media_effects_dist = (
+        changepoint_media_effects_dist
+    )
+    return np.asarray(
+        equations.ModelEquations(
+            model_context
+        )._coefficients_from_random_effects(
+            backend.to_tensor(beta_eta_combined, dtype=backend.float_dtype),
+            changepoint_info,
+        )
+    )
+
+  @parameterized.product(
+      media_effects_dist=(
+          constants.MEDIA_EFFECTS_LOG_NORMAL,
+          constants.MEDIA_EFFECTS_NORMAL,
+      ),
+      changepoint_media_effects_dist=(
+          constants.MEDIA_EFFECTS_LOG_NORMAL,
+          constants.MEDIA_EFFECTS_NORMAL,
+      ),
+      with_changepoints=(True, False),
+  )
+  def test_each_channel_uses_its_distribution(
+      self,
+      media_effects_dist,
+      changepoint_media_effects_dist,
+      with_changepoints,
+  ):
+    beta_eta_combined = (
+        np.random.default_rng(0)
+        .normal(size=(2, 4, 3))
+        .astype(backend.np_float_dtype)
+    )
+    info: changepoints.ChangepointInfo | None = None
+    if with_changepoints:
+      info = changepoints.get_changepoint_info(
+          n_times=6, changepoints={"c": [2]}, channel_names=["a", "b", "c"]
+      )
+
+    coefficients = self._coefficients(
+        beta_eta_combined,
+        media_effects_dist=media_effects_dist,
+        changepoint_media_effects_dist=changepoint_media_effects_dist,
+        changepoint_info=info,
+    )
+
+    def transform(x: np.ndarray, dist: str) -> np.ndarray:
+      return x if dist == constants.MEDIA_EFFECTS_NORMAL else np.exp(x)
+
+    expected = transform(beta_eta_combined, media_effects_dist)
+    if with_changepoints:
+      expected[..., 2] = transform(
+          beta_eta_combined[..., 2], changepoint_media_effects_dist
+      )
+    test_utils.assert_allclose(coefficients, expected, rtol=1e-6)
+
+  def test_large_normal_effect_does_not_overflow(self):
+    info = changepoints.get_changepoint_info(
+        n_times=6, changepoints={"b": [2]}, channel_names=["a", "b"]
+    )
+    beta_eta_combined = np.array([[0.5, 1e3]], dtype=backend.np_float_dtype)
+
+    coefficients = self._coefficients(
+        beta_eta_combined,
+        media_effects_dist=constants.MEDIA_EFFECTS_LOG_NORMAL,
+        changepoint_media_effects_dist=constants.MEDIA_EFFECTS_NORMAL,
+        changepoint_info=info,
+    )
+
+    test_utils.assert_allclose(coefficients, [[np.exp(0.5), 1e3]], rtol=1e-6)
 
 
 class LinearPredictorCounterfactualDifferenceTest(

@@ -34,6 +34,8 @@ their values never reach the model.
 `ModelContext` uses this module to build each channel type's
 `ChangepointInfo`, and the samplers use it to draw the interval adjustments and
 build each time period's coefficient.
+
+This module is internal to Meridian and isn't part of its public API.
 """
 
 from collections.abc import Collection, Mapping, Sequence
@@ -49,6 +51,7 @@ __all__ = [
     'ChangepointInfo',
     'changepoint_knot_overlaps',
     'expand_intervals',
+    'fill_channels',
     'get_changepoint_info',
     'interval_adjustments_distribution',
     'interval_weights',
@@ -153,6 +156,11 @@ class ChangepointInfo:
         self.n_channels
     )
     return indices
+
+  @property
+  def is_changepoint_channel(self) -> np.ndarray:
+    """Whether each channel of the type has changepoints, shape `(n_total,)`."""
+    return np.isin(np.arange(self.n_channels_total), self.channel_indices)
 
   @property
   def last_interval_one_hot(self) -> np.ndarray:
@@ -365,3 +373,20 @@ def merge_channels(
       backend.to_tensor(info.merge_indices),
       axis=-1,
   )
+
+
+def fill_channels(
+    x: backend.Tensor, *, value: float, info: ChangepointInfo
+) -> backend.Tensor:
+  """Sets the columns of channels with changepoints to `value`.
+
+  Args:
+    x: A tensor with all channels of the type on its last axis.
+    value: The value for the channels with changepoints.
+    info: The `ChangepointInfo` of the channel type.
+
+  Returns:
+    `x` with the columns of channels with changepoints set to `value`.
+  """
+  filler = backend.gather(x, backend.to_tensor(info.channel_indices), axis=-1)
+  return merge_channels(x=x, sub=backend.zeros_like(filler) + value, info=info)

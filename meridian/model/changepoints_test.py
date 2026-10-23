@@ -138,6 +138,9 @@ class GetChangepointInfoTest(parameterized.TestCase):
     assert info is not None
     # Columns 4 and 5 of `concat([x, sub])` hold the replacements for B, D.
     np.testing.assert_array_equal(info.merge_indices, [0, 4, 2, 5])
+    np.testing.assert_array_equal(
+        info.is_changepoint_channel, [False, True, False, True]
+    )
 
   def test_last_interval_one_hot(self):
     info = changepoints.get_changepoint_info(
@@ -278,6 +281,13 @@ class TimeVaryingMathTest(test_utils.MeridianTestCase, parameterized.TestCase):
     )
     expected = x.copy()
     expected[:, [0, 2]] = sub
+    test_utils.assert_allclose(result, expected)
+
+  def test_fill_channels(self):
+    x = self._normal(2, 3)  # (chains, all 3 channels)
+    result = changepoints.fill_channels(_tensor(x), value=1.0, info=self._info)
+    expected = x.copy()
+    expected[:, [0, 2]] = 1.0
     test_utils.assert_allclose(result, expected)
 
   def test_interval_adjustments_distribution(self):

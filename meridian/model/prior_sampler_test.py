@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections.abc import Mapping
+import itertools
 from unittest import mock
 
 from absl.testing import absltest
@@ -1166,30 +1167,44 @@ class TimeVaryingPriorSamplingTest(
           constants.TREATMENT_PRIOR_TYPE_MROI,
           constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION,
       ),
-      media_effects_dist=(
+      changepoint_media_effects_dist=(
           constants.MEDIA_EFFECTS_LOG_NORMAL,
           constants.MEDIA_EFFECTS_NORMAL,
       ),
   )
   def test_prior_keeps_its_whole_history_meaning(
-      self, prior_type: str, media_effects_dist: str
+      self, prior_type: str, changepoint_media_effects_dist: str
   ):
+    # The other channels use the other distribution.
+    media_effects_dist = (
+        constants.MEDIA_EFFECTS_NORMAL
+        if changepoint_media_effects_dist == constants.MEDIA_EFFECTS_LOG_NORMAL
+        else constants.MEDIA_EFFECTS_LOG_NORMAL
+    )
     model_context = self._context(
         media_prior_type=prior_type,
         rf_prior_type=prior_type,
+        changepoint_media_prior_type=prior_type,
+        changepoint_rf_prior_type=prior_type,
         media_effects_dist=media_effects_dist,
+        changepoint_media_effects_dist=changepoint_media_effects_dist,
     )
     draws = prior_sampler.PriorDistributionSampler(model_context=model_context)(
         n_draws=4, seed=1
     )
-    for is_rf in (False, True):
-      with self.subTest(is_rf=is_rf):
+    for is_rf, time_varying in itertools.product((False, True), repeat=2):
+      with self.subTest(is_rf=is_rf, time_varying=time_varying):
         self._assert_whole_history_meaning(
             model_context=model_context,
             draws=draws,
             prior_type=prior_type,
-            media_effects_dist=media_effects_dist,
+            media_effects_dist=(
+                changepoint_media_effects_dist
+                if time_varying
+                else media_effects_dist
+            ),
             is_rf=is_rf,
+            time_varying=time_varying,
         )
 
   def _assert_whole_history_meaning(
@@ -1200,8 +1215,9 @@ class TimeVaryingPriorSamplingTest(
       prior_type: str,
       media_effects_dist: str,
       is_rf: bool,
+      time_varying: bool,
   ):
-    """Asserts that the time-varying draws imply the drawn prior quantity."""
+    """Asserts that a channel's draws imply its drawn prior quantity."""
     eqn = equations.ModelEquations(model_context)
     if is_rf:
       changepoint_info = model_context._rf_changepoint_info
@@ -1278,19 +1294,28 @@ class TimeVaryingPriorSamplingTest(
           constants.TREATMENT_PRIOR_TYPE_CONTRIBUTION: constants.CONTRIBUTION_M,
       }[prior_type]
     assert changepoint_info is not None
-    channel = int(changepoint_info.channel_indices[0])
-
-    # The incremental outcome over all geos and time periods, using each time
-    # period's coefficient, matches the prior draw.
-    coefficients = changepoints.time_varying_coefficients(
-        beta_gx=backend.to_tensor(
-            np.asarray(beta_gx)[..., channel : channel + 1],
-            dtype=backend.float_dtype,
-        ),
-        zeta=zeta,
-        phi=changepoints.expand_intervals(varphi, changepoint_info.weights),
-        media_effects_dist=media_effects_dist,
-    )
+    beta_gx = np.asarray(beta_gx)
+    if time_varying:
+      channel = int(changepoint_info.channel_indices[0])
+      # The incremental outcome over all geos and time periods, using each
+      # time period's coefficient, matches the prior draw.
+      coefficients = changepoints.time_varying_coefficients(
+          beta_gx=backend.to_tensor(
+              beta_gx[..., channel : channel + 1], dtype=backend.float_dtype
+          ),
+          zeta=zeta,
+          phi=changepoints.expand_intervals(varphi, changepoint_info.weights),
+          media_effects_dist=media_effects_dist,
+      )
+    else:
+      channel = min(
+          set(range(beta_gx.shape[-1]))
+          - set(changepoint_info.channel_indices.tolist())
+      )
+      coefficients = np.broadcast_to(
+          beta_gx[..., np.newaxis, channel : channel + 1],
+          beta_gx.shape[:-1] + (self._N_TIMES_SHORT, 1),
+      )
     revenue_per_kpi = (
         np.ones((self._N_GEOS, self._N_TIMES_SHORT))
         if model_context.revenue_per_kpi is None
@@ -1341,6 +1366,8 @@ class TimeVaryingPriorSamplingTest(
             },
             media_prior_type=prior_type,
             rf_prior_type=prior_type,
+            changepoint_media_prior_type=prior_type,
+            changepoint_rf_prior_type=prior_type,
         ),
     )
     draws = prior_sampler.PriorDistributionSampler(model_context=model_context)(
